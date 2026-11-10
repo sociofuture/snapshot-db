@@ -20,10 +20,12 @@ use arena::Arena;
 use async_trait::async_trait;
 use clap::Parser;
 use datafusion::arrow::array::Array;
-use datafusion::arrow::datatypes::{DataType, Schema};
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::execution::context::SQLOptions;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::SendableRecordBatchStream;
+use futures::StreamExt;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use arrowload::ArrowLoader;
 use loader::{parse_load_data, Format, LineParser};
@@ -45,6 +47,13 @@ struct Args {
     /// Restore a saved image at startup, e.g. s3://bucket/prefix or file:///path.
     #[arg(long)]
     restore: Option<String>,
+    /// Memory that running queries (JOIN hash tables, sorts, aggregates) may use in total,
+    /// on top of --memory. A query that needs more fails; the server keeps running.
+    #[arg(long, default_value = "512M", value_parser = parse_size)]
+    query_memory: usize,
+    /// Largest result a single query may return, in rows (0 = unlimited).
+    #[arg(long, default_value_t = 1_000_000)]
+    max_rows: usize,
 }
 
 fn parse_size(s: &str) -> Result<usize, String> {
@@ -68,6 +77,8 @@ struct Inner {
     /// DataFusion catalog holding the loaded (immutable) tables. Never locked together with `store`
     /// across an await.
     ctx: SessionContext,
+    /// See `--max-rows`; 0 = unlimited.
+    max_rows: usize,
 }
 type Shared = Arc<Inner>;
 
@@ -416,15 +427,15 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Session {
         if matches!(first.as_str(), "select" | "with" | "(" | "values" | "explain") {
             let opts = SQLOptions::new().with_allow_ddl(false).with_allow_dml(false).with_allow_statements(false);
             let ctx = self.shared.ctx.clone();
+            let max_rows = self.shared.max_rows;
+            // Results are streamed batch by batch; nothing collects the whole result.
             let outcome = async {
                 let df = ctx.sql_with_options(q, opts).await?;
-                let schema = Arc::new(df.schema().as_arrow().clone());
-                let batches = df.collect().await?;
-                Ok::<_, datafusion::error::DataFusionError>((schema, batches))
+                df.execute_stream().await
             }
             .await;
             return match outcome {
-                Ok((schema, batches)) => send_batches(results, &schema, &batches).await,
+                Ok(stream) => send_stream(results, stream, max_rows).await,
                 Err(e) => results.error(ErrorKind::ER_PARSE_ERROR, e.to_string().as_bytes()).await,
             };
         }
@@ -450,12 +461,15 @@ fn mysql_type(dt: &DataType) -> ColumnType {
     }
 }
 
-/// Sends Arrow batches as a MySQL text-protocol result set.
-async fn send_batches<W: AsyncWrite + Send + Unpin>(
+/// Streams a query result as a MySQL text-protocol result set, one batch at a time, so the
+/// memory used is one batch no matter how large the result is. Stops with an error once more
+/// than `max_rows` rows would be sent (0 = unlimited).
+async fn send_stream<W: AsyncWrite + Send + Unpin>(
     results: QueryResultWriter<'_, W>,
-    schema: &Schema,
-    batches: &[RecordBatch],
+    mut stream: SendableRecordBatchStream,
+    max_rows: usize,
 ) -> io::Result<()> {
+    let schema = stream.schema();
     let cols: Vec<Column> = schema
         .fields()
         .iter()
@@ -466,10 +480,27 @@ async fn send_batches<W: AsyncWrite + Send + Unpin>(
             colflags: ColumnFlags::empty(),
         })
         .collect();
+    // Pull the first batch BEFORE sending the column header, so a failure at the start of
+    // execution (e.g. out of query memory) is a clean error response, not an error in the
+    // middle of a result set.
+    let mut next = stream.next().await;
+    if let Some(Err(e)) = &next {
+        return results.error(ErrorKind::ER_UNKNOWN_ERROR, e.to_string().as_bytes()).await;
+    }
     let mut w = results.start(&cols).await?;
     // MySQL writes DATETIME with a space, not Arrow's 'T'.
     let opts = FormatOptions::default().with_timestamp_format(Some("%Y-%m-%d %H:%M:%S%.f"));
-    for b in batches {
+    let mut sent = 0usize;
+    while let Some(item) = next {
+        let b = match item {
+            Ok(b) => b,
+            Err(e) => return w.finish_error(ErrorKind::ER_UNKNOWN_ERROR, &e.to_string().into_bytes()).await,
+        };
+        if max_rows > 0 && sent + b.num_rows() > max_rows {
+            let msg = format!("result is larger than --max-rows {max_rows}; add a WHERE / ON condition or a LIMIT");
+            return w.finish_error(ErrorKind::ER_UNKNOWN_ERROR, &msg.into_bytes()).await;
+        }
+        sent += b.num_rows();
         // Format the batch to strings synchronously: ArrayFormatter is not Send, so it must not
         // live across an await.
         let cells: Vec<Vec<Option<String>>> = {
@@ -495,6 +526,7 @@ async fn send_batches<W: AsyncWrite + Send + Unpin>(
             }
             w.end_row().await?;
         }
+        next = stream.next().await;
     }
     w.finish().await
 }
@@ -504,16 +536,23 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     // MySQL dialect: backtick identifiers, LIMIT a, b, ... Identifiers are folded to lower case.
     let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "MySQL");
+    // Cap the working memory of queries (hash tables, sorts, aggregates). The arena holds only the
+    // table data; this pool is separate and is what bounds a runaway JOIN.
+    let runtime = RuntimeEnvBuilder::new().with_memory_limit(args.query_memory, 1.0).build_arc()?;
     let store: Shared = Arc::new(Inner {
         store: Mutex::new(Store { arena: Arena::new(args.memory)?, tables: HashMap::new() }),
-        ctx: SessionContext::new_with_config(config),
+        ctx: SessionContext::new_with_config_rt(config, runtime),
+        max_rows: args.max_rows,
     });
     if let Some(url) = &args.restore {
         let used = persist::restore(&store, url).await.map_err(|e| anyhow::anyhow!("restore failed: {e}"))?;
         eprintln!("restored {used} bytes from {url}");
     }
     let listener = TcpListener::bind(&args.listen).await?;
-    eprintln!("snapshot-db listening on {} (arena {} bytes)", args.listen, args.memory);
+    eprintln!(
+        "snapshot-db listening on {} (arena {} bytes, query memory {} bytes, max rows {})",
+        args.listen, args.memory, args.query_memory, args.max_rows
+    );
     loop {
         let (stream, _) = listener.accept().await?;
         let session = Session { shared: store.clone(), loading: None };
