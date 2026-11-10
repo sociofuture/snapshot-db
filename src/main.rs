@@ -6,6 +6,7 @@
 //! All memory is one arena reserved at startup (`--memory`). Running out is an error.
 
 mod arena;
+mod arrowload;
 mod loader;
 mod persist;
 mod table;
@@ -24,7 +25,8 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::execution::context::SQLOptions;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use loader::{parse_load_data, LineParser};
+use arrowload::ArrowLoader;
+use loader::{parse_load_data, Format, LineParser};
 use opensrv_mysql::{
     AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind,
     InitWriter, OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter,
@@ -69,9 +71,31 @@ struct Inner {
 }
 type Shared = Arc<Inner>;
 
+/// How the bytes of the current LOAD DATA are interpreted.
+enum Decoder {
+    Csv(LineParser),
+    Arrow(ArrowLoader),
+}
+
+impl Decoder {
+    fn feed(&mut self, chunk: &[u8], t: &mut Table, arena: &mut Arena) -> Result<(), String> {
+        match self {
+            Decoder::Csv(p) => p.feed(chunk, &mut |row| t.push_row(arena, row)),
+            Decoder::Arrow(a) => a.feed(chunk, t, arena),
+        }
+    }
+
+    fn finish(&mut self, t: &mut Table, arena: &mut Arena) -> Result<(), String> {
+        match self {
+            Decoder::Csv(p) => p.finish(&mut |row| t.push_row(arena, row)),
+            Decoder::Arrow(a) => a.finish(),
+        }
+    }
+}
+
 struct Loading {
     table: String,
-    parser: LineParser,
+    parser: Decoder,
     error: Option<String>,
 }
 
@@ -182,7 +206,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Session {
             return None; // on_query reports why
         }
         t.state = State::Loading;
-        self.loading = Some(Loading { table: opts.table.clone(), parser: LineParser::new(&opts), error: None });
+        let parser = match opts.format {
+            Format::Csv => Decoder::Csv(LineParser::new(&opts)),
+            Format::Arrow => Decoder::Arrow(ArrowLoader::new()),
+        };
+        self.loading = Some(Loading { table: opts.table.clone(), parser, error: None });
         Some(opts.file)
     }
 
@@ -194,7 +222,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Session {
         let mut st = self.shared.store.lock().unwrap();
         let Store { arena, tables } = &mut *st;
         let t = tables.get_mut(&l.table).expect("table vanished");
-        if let Err(e) = l.parser.feed(chunk, &mut |row| t.push_row(arena, row)) {
+        if let Err(e) = l.parser.feed(chunk, t, arena) {
             l.error = Some(e);
         }
     }
@@ -207,7 +235,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Session {
             let Store { arena, tables } = &mut *st;
             let t = tables.get_mut(&l.table).expect("table vanished");
             if l.error.is_none() {
-                if let Err(e) = l.parser.finish(&mut |row| t.push_row(arena, row)) {
+                if let Err(e) = l.parser.finish(t, arena) {
                     l.error = Some(e);
                 }
             }

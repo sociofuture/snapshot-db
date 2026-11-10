@@ -56,6 +56,49 @@ LOAD DATA LOCAL INFILE 'employee.csv' INTO TABLE employee
 - **1つのテーブルをロードできるのは1回だけ**。成功したテーブルへの再ロードは拒否される。
   `REPLACE` / `IGNORE`(`LOAD DATA ... REPLACE INTO`)も使えない。
 
+#### バイナリ(Arrow IPC)で流し込む: `FORMAT ARROW`
+
+CSV の代わりに、[Arrow IPC ストリーム](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format)をそのまま送れる。
+CSV のパースがなく、列のバッファをアリーナにコピーするだけなので速い。
+
+```sql
+LOAD DATA LOCAL INFILE 'employee.arrows' INTO TABLE employee FORMAT ARROW;
+```
+
+- ファイル名は形だけ(JDBC で `InputStream` を渡すときは使われない)。`FORMAT ARROW` は、このサーバー独自の書き方。
+- **スキーマは宣言したテーブルと完全に一致させる**。列の数、名前(大文字小文字は無視)、Arrow の型が違うとエラー。型の変換はしない。
+
+  | テーブルの型 | Arrow の型 |
+  |---|---|
+  | `TINYINT` `SMALLINT` `INT` `BIGINT` | `Int8` `Int16` `Int32` `Int64` |
+  | `DOUBLE` | `Float64` |
+  | `DECIMAL(p,s)` | `Decimal128(p, s)` |
+  | `DATE` | `Date32` |
+  | `DATETIME` `TIMESTAMP` | `Timestamp(Microsecond, タイムゾーンなし)` |
+  | `VARCHAR` など | `Utf8`(`LargeUtf8` や `Utf8View`、辞書型は不可) |
+
+- バッチは複数に分けてよい。ストリームの終端が来ていない(途切れた)場合もエラー。
+- `ROWS` の照合、1回だけロード、失敗時のやり直しは CSV と同じ。
+
+**Java から、メモリ上で作って渡す**例(MySQL Connector/J と Arrow Java)。
+
+```java
+// 接続URL: jdbc:mysql://host:3307/?allowLoadLocalInfile=true
+ByteArrayOutputStream buf = new ByteArrayOutputStream();
+try (ArrowStreamWriter w = new ArrowStreamWriter(root, null, Channels.newChannel(buf))) {
+    w.start(); w.writeBatch(); w.end();   // root: VectorSchemaRoot(テーブルと同じスキーマ)
+}
+
+try (Statement st = conn.createStatement()) {
+    st.unwrap(com.mysql.cj.jdbc.JdbcStatement.class)
+      .setLocalInfileInputStream(new ByteArrayInputStream(buf.toByteArray()));
+    st.execute("LOAD DATA LOCAL INFILE 'ignored.arrows' INTO TABLE employee FORMAT ARROW");
+}
+```
+
+件数が多いときは、`PipedInputStream` などで、作りながら流すこともできる。
+(この Java の例は、Connector/J の API の記憶に基づく。このリポジトリのテストは Rust の MySQL クライアントで行っており、Java では未確認。)
+
 ### 3. 読む
 
 ```sql

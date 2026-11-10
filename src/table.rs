@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use datafusion::arrow::array::{make_array, ArrayData, ArrayRef};
+use datafusion::arrow::array::{make_array, Array, ArrayData, ArrayRef, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 
@@ -206,6 +206,76 @@ impl Table {
             }
         }
         self.rows += 1;
+        Ok(())
+    }
+
+    /// Appends a whole Arrow batch. The batch must match the table exactly: same number of
+    /// columns, same names (ignoring case) and the same Arrow types. Nothing is converted, which is
+    /// what makes this a plain copy of the column buffers into the arena.
+    pub fn push_batch(&mut self, arena: &mut Arena, batch: &RecordBatch) -> Result<(), String> {
+        let n = batch.num_rows();
+        if batch.num_columns() != self.cols.len() {
+            return Err(format!("Arrow data has {} columns, table '{}' has {}", batch.num_columns(), self.name, self.cols.len()));
+        }
+        let schema = batch.schema();
+        for (i, c) in self.cols.iter().enumerate() {
+            let f = schema.field(i);
+            if !f.name().eq_ignore_ascii_case(&c.name) {
+                return Err(format!("column {}: Arrow field is named '{}', the table has '{}'", i + 1, f.name(), c.name));
+            }
+            let want = c.ty.arrow();
+            if f.data_type() != &want {
+                return Err(format!("column {}: Arrow type is {}, the table expects {}", c.name, f.data_type(), want));
+            }
+        }
+        if self.rows + n > self.rows_expected {
+            return Err(format!("more rows than the declared ROWS {}", self.rows_expected));
+        }
+        let first = self.rows;
+        for (i, c) in self.cols.iter().enumerate() {
+            let arr = batch.column(i);
+            let lay = &mut self.layout[i];
+            for r in 0..n {
+                if arr.is_valid(r) {
+                    let byte = lay.validity.start + (first + r) / 8;
+                    arena.slice_mut(&(byte..byte + 1))[0] |= 1 << ((first + r) % 8);
+                }
+            }
+            if n == 0 {
+                continue;
+            }
+            if c.ty == ColType::Varchar {
+                let sa = arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| format!("column {}: expected a Utf8 array", c.name))?;
+                let offs = sa.value_offsets();
+                let base = offs[0] as usize;
+                let total = offs[n] as usize - base;
+                if lay.data_used + total > lay.data.len() {
+                    return Err(format!(
+                        "column {}: VARCHAR data exceeds the space reserved by BYTES_PER_ROW_HINT",
+                        c.name
+                    ));
+                }
+                let dst = lay.data.start + lay.data_used;
+                arena.slice_mut(&(dst..dst + total)).copy_from_slice(&sa.value_data()[base..base + total]);
+                for r in 1..=n {
+                    let v = (lay.data_used + offs[r] as usize - base) as u32;
+                    let off = lay.values.start + (first + r) * 4;
+                    arena.slice_mut(&(off..off + 4)).copy_from_slice(&v.to_le_bytes());
+                }
+                lay.data_used += total;
+            } else {
+                let w = c.ty.width();
+                let data = arr.to_data();
+                let src = data.buffers()[0].as_slice();
+                let from = data.offset() * w;
+                let dst = lay.values.start + first * w;
+                arena.slice_mut(&(dst..dst + n * w)).copy_from_slice(&src[from..from + n * w]);
+            }
+        }
+        self.rows += n;
         Ok(())
     }
 

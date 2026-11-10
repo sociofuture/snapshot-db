@@ -1,7 +1,16 @@
 //! Parsing of the LOAD DATA statement options and of the delimited file stream.
 //! The stream arrives in arbitrary chunks, so lines are reassembled across chunk boundaries.
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Format {
+    /// Delimited text (the default).
+    Csv,
+    /// Arrow IPC stream, binary.
+    Arrow,
+}
+
 pub struct LoadOpts {
+    pub format: Format,
     pub file: String,
     pub table: String,
     pub term: u8,
@@ -55,7 +64,7 @@ pub fn parse_load_data(query: &str) -> Option<Result<LoadOpts, String>> {
     let Some(table) = tokens.get(into + 1).map(|t| t.trim_matches('`').to_ascii_lowercase()) else {
         return Some(Err("missing table name".into()));
     };
-    let mut o = LoadOpts { file, table, term: b'\t', enclosed: None, ignore_lines: 0 };
+    let mut o = LoadOpts { format: Format::Csv, file, table, term: b'\t', enclosed: None, ignore_lines: 0 };
     let mut i = into + 2;
     while i < tokens.len() {
         match up[i].as_str() {
@@ -72,6 +81,14 @@ pub fn parse_load_data(query: &str) -> Option<Result<LoadOpts, String>> {
                 };
                 o.enclosed = Some(d);
                 i += 3;
+            }
+            "FORMAT" => {
+                match tokens.get(i + 1).map(|t| unq(t).to_ascii_uppercase()).as_deref() {
+                    Some("ARROW") => o.format = Format::Arrow,
+                    Some(other) => return Some(Err(format!("unsupported FORMAT '{other}' (only ARROW)"))),
+                    None => return Some(Err("FORMAT needs a value (ARROW)".into())),
+                }
+                i += 2;
             }
             "IGNORE" => {
                 let n = tokens.get(i + 1).and_then(|t| t.parse::<usize>().ok());
@@ -163,6 +180,10 @@ mod tests {
     fn parses_options() {
         let o = opts("LOAD DATA LOCAL INFILE 'a.csv' INTO TABLE `t` FIELDS TERMINATED BY ',' ENCLOSED BY '\"' IGNORE 1 LINES");
         assert_eq!((o.file.as_str(), o.table.as_str(), o.term, o.enclosed, o.ignore_lines), ("a.csv", "t", b',', Some(b'"'), 1));
+        assert_eq!(o.format, Format::Csv);
+        let a = opts("LOAD DATA LOCAL INFILE 'a.arrows' INTO TABLE t FORMAT ARROW");
+        assert_eq!(a.format, Format::Arrow);
+        assert!(parse_load_data("LOAD DATA LOCAL INFILE 'a' INTO TABLE t FORMAT PARQUET").unwrap().is_err());
         assert!(parse_load_data("LOAD DATA LOCAL INFILE 'a' REPLACE INTO TABLE t").unwrap().is_err());
         assert!(parse_load_data("SELECT 1").is_none());
     }
