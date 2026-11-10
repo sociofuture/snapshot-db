@@ -89,21 +89,21 @@ pub async fn save(shared: &Inner, url: &str) -> Result<usize, String> {
     Ok(used)
 }
 
-/// Reads a saved image into the (empty) arena and registers the loaded tables.
+/// Reads a saved memory image into the (empty) arena and registers the loaded tables.
 pub async fn restore(shared: &Inner, url: &str) -> Result<usize, String> {
     let (store, base) = open(url)?;
     let raw = store.get(&base.clone().join(MANIFEST)).await.map_err(|e| format!("manifest: {e}"))?;
     let raw = raw.bytes().await.map_err(|e| e.to_string())?;
     let manifest: Manifest = serde_json::from_slice(&raw).map_err(|e| format!("manifest: {e}"))?;
     if manifest.version != VERSION {
-        return Err(format!("unsupported image version {}", manifest.version));
+        return Err(format!("unsupported memory image version {}", manifest.version));
     }
     let used = manifest.arena_used;
     {
         let st = shared.store.lock().unwrap();
         if used > st.arena.capacity() {
             return Err(format!(
-                "image needs {used} bytes but --memory is {} (start with a larger --memory)",
+                "the memory image needs {used} bytes but --memory is {} (start with a larger --memory)",
                 st.arena.capacity()
             ));
         }

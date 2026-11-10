@@ -44,7 +44,7 @@ struct Args {
     /// Size of the memory arena, fixed for the life of the process (e.g. 512M, 8G).
     #[arg(long, default_value = "256M", value_parser = parse_size)]
     memory: usize,
-    /// Restore a saved image at startup, e.g. s3://bucket/prefix or file:///path.
+    /// Restore a saved memory image at startup, e.g. s3://bucket/prefix or file:///path.
     #[arg(long)]
     restore: Option<String>,
     /// Memory that running queries (JOIN hash tables, sorts, aggregates) may use in total,

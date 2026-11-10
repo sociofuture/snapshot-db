@@ -53,7 +53,7 @@ impl Arena {
         Ok(Arena { mem: Arc::new(map), base, len: size, used: 0 })
     }
 
-    /// Marks the first `used` bytes as allocated (after the image has been restored into them).
+    /// Marks the first `used` bytes as allocated (after the memory image has been restored into them).
     pub fn set_used(&mut self, used: usize) {
         assert!(used <= self.len);
         self.used = used;
