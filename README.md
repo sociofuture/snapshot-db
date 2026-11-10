@@ -106,9 +106,35 @@ snapshot-db --memory 512M --restore s3://my-bucket/asof-2026-04-01
 - 復元は `arena.bin` を読み込み、SHA-256 を照合する。**壊れていると起動しない**。
   ロード済みのテーブルは復元後も不変。宣言だけでロードしていないテーブルは空で復元され、1回だけロードできる。
 - `--memory` が画像より小さいときは、必要なサイズを示して起動に失敗する。
-- S3 の設定は環境変数から読む: `AWS_ACCESS_KEY_ID` `AWS_SECRET_ACCESS_KEY` `AWS_REGION`
-  (MinIO などは `AWS_ENDPOINT` と `AWS_ALLOW_HTTP=true`)。`file:///...` ならローカルのフォルダに保存できる。
 - 終了時の自動保存はない。`SNAPSHOT SAVE` を明示的に実行する。
+- `file:///...` ならローカルのフォルダに保存できる。
+
+### S3 の認証と設定
+
+認証情報は、アクセスキーを渡さなければ次の順で自動的に探される(`object_store` の標準の動作)。
+
+1. EKS の Pod(`AWS_WEB_IDENTITY_TOKEN_FILE`)
+2. ECS のタスクロール(`AWS_CONTAINER_CREDENTIALS_*`)
+3. **EC2 のインスタンスメタデータ(IMDSv2)**。インスタンスに付いた **IAM ロールがそのまま使える**。
+
+そのため EC2 上では、キーの設定なしで動く想定(実際の EC2 での動作は未確認。ソースの読み取りによる)。
+明示したいときだけ `AWS_ACCESS_KEY_ID` `AWS_SECRET_ACCESS_KEY` を環境変数で渡す。
+
+**リージョンは指定する**。`AWS_REGION` がないと `us-east-1` と見なされる。
+
+```bash
+AWS_REGION=ap-northeast-1 snapshot-db --memory 512M --restore s3://my-bucket/asof-2026-04-01
+```
+
+IAM ロールに必要な権限(保存先のバケットとプレフィックスに対して):
+
+| 操作 | 権限 |
+|---|---|
+| 保存 | `s3:PutObject` `s3:AbortMultipartUpload` |
+| 復元 | `s3:GetObject` |
+| どちらも | `s3:ListBucket`(バケットに対して) |
+
+MinIO などは `AWS_ENDPOINT` と、http の場合は `AWS_ALLOW_HTTP=true` を指定する。
 
 ## 設計のメモ
 
@@ -139,7 +165,7 @@ cargo test
 
 ## できないこと・今後
 
-- **認証**: ユーザーとパスワードを検査していない。
+- **認証**: ユーザーとパスワードを検査していない(社内のネットワークでの利用が前提)。
 - **SHOW / information_schema**: 未対応(BI ツールの接続時の問い合わせの一部は固定応答を返す)。
 - **プリペアドステートメント**: 未対応(クライアント側で SQL を組み立てる接続は動く)。
 - **インデックス**: なし。全件を読むが、列指向でメモリ上にあるため 1 万行規模では十分速い。必要になったら、
